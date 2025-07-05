@@ -1,0 +1,27 @@
+variables:
+    CONTAINER_IMAGE_NAME: "repo.wolle.dev/tools/maven-mirror-cache"
+
+build-tag:
+    image: docker:latest
+    stage: build
+    before_script:
+        - mkdir -p ~/.docker
+        - echo $DOCKER_AUTH_CONFIG > ~/.docker/config.json
+    only:
+        - tags
+    script:
+        - docker build --progress plain --tag ${CONTAINER_IMAGE_NAME}:$CI_COMMIT_REF_SLUG .
+        - docker push ${CONTAINER_IMAGE_NAME}:$CI_COMMIT_REF_SLUG
+
+build-main:
+    image: docker:latest
+    stage: build
+    before_script:
+        - mkdir -p ~/.docker
+        - echo $DOCKER_AUTH_CONFIG > ~/.docker/config.json
+    only:
+        - main
+    script:
+        - docker build --progress plain --tag ${CONTAINER_IMAGE_NAME}:$CI_COMMIT_REF_SLUG --tag ${CONTAINER_IMAGE_NAME}:latest .
+        - docker push ${CONTAINER_IMAGE_NAME}:$CI_COMMIT_REF_SLUG
+        - docker push ${CONTAINER_IMAGE_NAME}:latest

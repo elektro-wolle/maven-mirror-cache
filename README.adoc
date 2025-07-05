@@ -1,0 +1,176 @@
+= Maven Mirror Cache
+
+A high-performance Maven repository mirror cache implemented in Rust. This service acts as a proxy between your build tools and Maven repositories, caching artifacts locally to improve build times and reduce external network dependencies.
+
+== Features
+
+* **Multi-Repository Support**: Configure multiple Maven repositories with priority-based failover
+
+* **Intelligent Caching**:
+** Configurable cache TTL for artifacts
+** Negative caching for missing artifacts
+** Automatic cache cleanup based on max. total size and last access
+** **FAST**: 1.500 req/s, 500 MB/s easy to achieve with link:https://orbstack.dev[OrbStack] on a laptop.
+* **Concurrent Downloads**: Configurable limit on simultaneous downloads
+
+* **Database-Backend**: PostgreSQL backend for reliable metadata storage
+** async tracking of downloads, not blocking the data-transfer
+
+* **Monitoring**:
+** Health check endpoint
+** Cache statistics
+** Server timing headers for performance monitoring
+
+* **Security**:
+** Optional TLS support
+** Custom HTTP headers support per repository
+
+* **Docker Support**: Ready to run with Docker and docker-compose
+
+== Configuration
+
+The service is configured via a YAML file. Here’s an example configuration:
+
+[source,yaml]
+----
+cache_dir: "./cache"
+database_url: "postgresql://postgres:password@localhost/maven_cache"
+cache_ttl: 24h
+negative_ttl: 1h
+max_cache_size: 1000000000
+number_of_files_to_delete: 10
+max_concurrent_downloads: 20
+cleanup_interval: 15m
+
+server:
+    host: "0.0.0.0"
+    port: 8080
+    request_timeout: 60s
+#    tls:
+#        cert_path: "config/localhost.crt"
+#        key_path: "config/localhost.key"
+
+# Repository configurations - all are tried simultaneously, first success wins
+# The priority is converted to a sleep(), to increase the possibility of an
+# higher prioritized answer (0 = highest prio/no-sleep, 255 = lowest / 2.55 s sleep).
+repositories:
+    -   name: "maven-central"
+        url: "https://repo1.maven.org/maven2"
+        priority: 0
+        timeout: 30s
+
+    -   name: "spring-releases"
+        url: "https://repo.spring.io/release"
+        priority: 2
+        timeout: 30s
+----
+
+
+== Running Locally
+
+. Start PostgreSQL from `docker-compose.yml`
+
+[source, bash]
+----
+docker compose up postgres -d
+----
+
+[start=2]
+. Configure the application by creating a `config.yaml` file (see example above)
+. Run the application:
+
+[source,bash]
+----
+export DATABASE_URL=postgresql://postgres:password@postgres:5432/maven_cache
+cargo run
+----
+
+The service will be available at `http://localhost:8080`
+
+== Running with Docker Compose
+
+Create a `docker-compose.yml` file, for production use, please *don’t* expose the postgres ports.
+
+.docker-compose.yml
+[soource, yaml]
+----
+services:
+    postgres:
+        image: postgres:17
+        environment:
+            POSTGRES_DB: maven_cache
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: password
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+
+    maven-cache:
+        image: ghcr.io/elektro-wolle/maven-mirror-cache:latest
+        ports:
+            - "8080:8080"
+        volumes:
+            - ./cache:/app/cache
+            - ./config.yaml:/app/config.yaml:ro
+            - ./config/:/app/config/:ro
+        environment:
+            - RUST_LOG=info
+            - DATABASE_URL=postgresql://postgres:password@postgres:5432/maven_cache
+
+volumes:
+    postgres_data:
+
+----
+
+Start the services:
+
+[source,bash]
+----
+docker-compose up -d
+----
+
+== HTTPS Support
+
+To enable HTTPS, update the configuration in `config.yaml`:
+
+[source,yaml]
+----
+# ... other settings
+server:
+  # ... other server settings
+  tls:
+    cert_path: "config/localhost.crt"
+    key_path: "config/localhost.key"
+----
+
+== Using with Maven
+
+Add the following to your `settings.xml`:
+
+.~/.m2/settings.xml
+[source,xml]
+----
+<settings>
+    <mirrors>
+        <mirror>
+            <id>central-proxy</id>
+            <name>Local proxy of central repo</name>
+            <url>http://name-wherever-it-is-deploy-in-your-lan:8080/</url>
+            <mirrorOf>*</mirrorOf>
+        </mirror>
+    </mirrors>
+</settings>
+----
+
+== Monitoring
+
+- Health Check: `GET /health`
+- Cache Statistics: `GET /stats`
+
+== Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+== License
+
+link:LICENSE[BSD 2-Clause License]
+

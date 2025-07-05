@@ -1,0 +1,47 @@
+# Maven Mirror Cache Configuration (YAML format)
+
+cache_dir: "./cache"
+database_url: "postgresql://postgres:password@localhost/maven_cache"
+cache_ttl: 24h
+negative_ttl: 1h
+max_cache_size: 1000000000
+number_of_files_to_delete: 10
+max_concurrent_downloads: 20
+cleanup_interval: 15m
+
+server:
+    host: "0.0.0.0"
+    port: 8080
+    request_timeout: 60s
+#    tls:
+#        cert_path: "config/localhost.crt"
+#        key_path: "config/localhost.key"
+
+# Repository configurations - all are tried simultaneously, first success wins
+# The priority is converted to a sleep(), to increase the possibility of an
+# higher prioritized answer (0 = highest prio/no-sleep, 255 = lowest / 2.55 s sleep).
+repositories:
+    -   name: "maven-central"
+        url: "https://repo1.maven.org/maven2"
+        priority: 0
+        timeout: 30s
+
+    -   name: "spring-releases"
+        url: "https://repo.spring.io/release"
+        priority: 2
+        timeout: 30s
+
+    -   name: "spring-milestones"
+        url: "https://repo.spring.io/milestone"
+        priority: 3
+        timeout: 30s
+
+    -   name: "gradle-plugins"
+        url: "https://plugins.gradle.org/m2"
+        priority: 4
+        timeout: 30s
+
+    -   name: "sonatype-snapshots"
+        url: "https://oss.sonatype.org/content/repositories/snapshots"
+        priority: 5
+        timeout: 30s

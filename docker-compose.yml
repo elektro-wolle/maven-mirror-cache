@@ -1,0 +1,27 @@
+services:
+    postgres:
+        image: postgres:17
+        environment:
+            POSTGRES_DB: maven_cache
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: password
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        ports:
+            - "5433:5432"
+
+    maven-cache:
+        build:
+            context: .
+        ports:
+            - "8080:8080"
+        volumes:
+            - ./cache:/app/cache
+            - ./config.yaml:/app/config.yaml:ro
+            - ./config/:/app/config/:ro
+        environment:
+            - RUST_LOG=info
+            - DATABASE_URL=postgresql://postgres:password@postgres:5432/maven_cache
+
+volumes:
+    postgres_data:
