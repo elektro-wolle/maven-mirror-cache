@@ -45,8 +45,11 @@ jobs:
                       type=semver,pattern={{major}}.{{minor}}
                       type=semver,pattern={{major}}
                   labels: |
-                      org.opencontainers.image.source=https://github.com/${{ github.repository }}
+                      org.opencontainers.image.title=maven-mirror-cache
                       org.opencontainers.image.description=Fast maven repository cache
+                      org.opencontainers.image.vendor=Wolfgang Jung
+                  annotations: |
+                      org.opencontainers.image.source=https://github.com/${{ github.repository }}
                       org.opencontainers.image.licenses=BSD-2-Clause
                       org.opencontainers.image.created={{date 'yyyy-MM-dd'}}
                       org.opencontainers.image.revision=${{ github.sha }}
