@@ -2,10 +2,11 @@ use crate::cache::{Cache, FetchResult};
 use crate::utils::guess_content_type;
 use async_trait::async_trait;
 use axum::http::header;
+use futures::StreamExt;
 use reqwest::RequestBuilder;
 use tempfile::NamedTempFile;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::{info, trace, warn};
 
 #[async_trait]
@@ -31,7 +32,7 @@ impl RemoteFetcher for Cache {
                 warn!("Failed to fetch from {}: {}", repo_name, e);
                 return None;
             }
-            Ok(mut response) => {
+            Ok(response) => {
                 let artifact_path = artifact_path.as_str();
                 if response.status().is_success() {
                     let content_type = response
@@ -46,31 +47,33 @@ impl RemoteFetcher for Cache {
                         return None;
                     }
                     // safe, we just checked on Err
-                    let mut file = file.unwrap();
-                    while let Ok(x) = response.chunk().await {
-                        match x {
-                            Some(content) => {
+                    let mut writer = BufWriter::with_capacity(262_144, file.unwrap());
+                    let mut stream = response.bytes_stream();
+
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Err(e) => {
+                                info!("Error downloading {}: {}", artifact_path, e);
+                                return None;
+                            }
+                            Ok(chunk) => {
                                 trace!(
                                     "partially downloaded {} from {} ({} bytes)",
                                     artifact_path,
                                     repo_name,
-                                    content.len()
+                                    chunk.len()
                                 );
-                                let result = file.write(content.iter().as_slice()).await;
-                                if let Err(e) = result {
-                                    warn!(
-                                        "Failed to write response body from {} to file {}: {}",
-                                        artifact_path,
-                                        temp_file.path().display(),
-                                        e
-                                    );
+                                let write_result = writer.write_all(&chunk).await;
+                                if let Err(e) = write_result {
+                                    info!("Error writing to {}: {}", artifact_path, e);
+                                    return None;
                                 }
                             }
-                            None => {
-                                trace!("No more data to read");
-                                break;
-                            }
+
                         }
+                    }
+                    if let Err(e) = writer.flush().await {
+                        info!("Error flushing to {}: {}", artifact_path, e);
                     }
                     return Some(FetchResult {
                         downloaded_file: temp_file,
@@ -94,7 +97,7 @@ impl RemoteFetcher for Cache {
 #[cfg(test)]
 mod tests {
     use crate::cache::{Cache, FetchResult};
-    use crate::remote_fetcher::{guess_content_type, RemoteFetcher};
+    use crate::remote_fetcher::{RemoteFetcher, guess_content_type};
     use async_trait::async_trait;
     use bytes::Bytes;
     use reqwest::RequestBuilder;
