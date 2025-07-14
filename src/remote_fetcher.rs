@@ -1,13 +1,17 @@
 use crate::cache::{Cache, FetchResult};
+use crate::utils::guess_content_type;
 use async_trait::async_trait;
 use axum::http::header;
 use reqwest::RequestBuilder;
-use tracing::{info, warn};
-use crate::utils::guess_content_type;
+use tempfile::NamedTempFile;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tracing::{info, trace, warn};
 
 #[async_trait]
 pub trait RemoteFetcher {
     async fn fetch_from_remote(
+        temp_file: NamedTempFile,
         artifact_path: String,
         repo_name: String,
         request: RequestBuilder,
@@ -17,12 +21,17 @@ pub trait RemoteFetcher {
 #[async_trait]
 impl RemoteFetcher for Cache {
     async fn fetch_from_remote(
+        temp_file: NamedTempFile,
         artifact_path: String,
         repo_name: String,
         request: RequestBuilder,
     ) -> Option<FetchResult> {
         match request.send().await {
-            Ok(response) => {
+            Err(e) => {
+                warn!("Failed to fetch from {}: {}", repo_name, e);
+                return None;
+            }
+            Ok(mut response) => {
                 let artifact_path = artifact_path.as_str();
                 if response.status().is_success() {
                     let content_type = response
@@ -31,25 +40,43 @@ impl RemoteFetcher for Cache {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_else(|| guess_content_type(artifact_path))
                         .to_string();
-
-                    match response.bytes().await {
-                        Ok(content) => {
-                            info!(
-                                "Successfully downloaded {} from {} ({} bytes)",
-                                artifact_path,
-                                repo_name,
-                                content.len()
-                            );
-                            return Some(FetchResult {
-                                content,
-                                content_type,
-                                repository_name: repo_name,
-                            });
-                        }
-                        Err(e) => {
-                            warn!("Failed to read response body from {}: {}", repo_name, e);
+                    let file = fs::File::create(&temp_file).await;
+                    if let Err(e) = file {
+                        info!("Unable to create tmp file: {}", e);
+                        return None;
+                    }
+                    // safe, we just checked on Err
+                    let mut file = file.unwrap();
+                    while let Ok(x) = response.chunk().await {
+                        match x {
+                            Some(content) => {
+                                trace!(
+                                    "partially downloaded {} from {} ({} bytes)",
+                                    artifact_path,
+                                    repo_name,
+                                    content.len()
+                                );
+                                let result = file.write(content.iter().as_slice()).await;
+                                if let Err(e) = result {
+                                    warn!(
+                                        "Failed to write response body from {} to file {}: {}",
+                                        artifact_path,
+                                        temp_file.path().display(),
+                                        e
+                                    );
+                                }
+                            }
+                            None => {
+                                trace!("No more data to read");
+                                break;
+                            }
                         }
                     }
+                    return Some(FetchResult {
+                        downloaded_file: temp_file,
+                        content_type,
+                        repository_name: repo_name,
+                    });
                 } else {
                     info!(
                         "Repository {} returned status {} for {}",
@@ -58,9 +85,6 @@ impl RemoteFetcher for Cache {
                         artifact_path
                     );
                 }
-            }
-            Err(e) => {
-                warn!("Failed to fetch from {}: {}", repo_name, e);
             }
         }
         None
@@ -76,9 +100,12 @@ mod tests {
     use reqwest::RequestBuilder;
     use std::error::Error;
     use std::time::Duration;
+    use tempfile::NamedTempFile;
     use testcontainers::core::WaitFor;
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{Image, ImageExt};
+    use tokio::fs::File;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Clone)]
     struct Nginx {}
@@ -130,17 +157,25 @@ mod tests {
         let request = client.get(format!("{}/{}", base_url, test_filename));
 
         // Call the RemoteFetcher implementation
-        let result =
-            Cache::fetch_from_remote(test_filename.to_string(), "test-repo".to_string(), request)
-                .await;
+        let temp_file = NamedTempFile::new()?;
+
+        let result = Cache::fetch_from_remote(
+            temp_file,
+            test_filename.to_string(),
+            "test-repo".to_string(),
+            request,
+        )
+        .await;
 
         // Verify the result
         assert!(result.is_some(), "Expected a successful fetch result");
         let fetch_result = result.unwrap();
-        assert_eq!(fetch_result.content, Bytes::from(test_content));
         assert_eq!(fetch_result.repository_name, "test-repo");
         assert_eq!(fetch_result.content_type, "application/java-archive");
-
+        let mut f = File::open(fetch_result.downloaded_file).await?;
+        let mut s = String::new();
+        f.read_to_string(&mut s).await.unwrap();
+        assert_eq!(s, Bytes::from(test_content));
         Ok(())
     }
 
@@ -159,8 +194,11 @@ mod tests {
         let client = reqwest::Client::new();
         let request = client.get(format!("{}/{}", base_url, "non-existent-file.jar"));
 
+        let temp_file = NamedTempFile::new()?;
+
         // Call the RemoteFetcher implementation
         let result = Cache::fetch_from_remote(
+            temp_file,
             "non-existent-file.jar".to_string(),
             "test-repo".to_string(),
             request,
@@ -199,9 +237,15 @@ mod tests {
             .timeout(Duration::new(0, 10)); // Extremely short timeout to force timeout error
 
         // Call the RemoteFetcher implementation
-        let result =
-            Cache::fetch_from_remote(test_filename.to_string(), "test-repo".to_string(), request)
-                .await;
+        let temp_file = NamedTempFile::new()?;
+
+        let result = Cache::fetch_from_remote(
+            temp_file,
+            test_filename.to_string(),
+            "test-repo".to_string(),
+            request,
+        )
+        .await;
 
         // Verify the result
         assert!(
@@ -255,11 +299,16 @@ mod tests {
             // Create a reqwest client
             let client = reqwest::Client::new();
             let request = client.get(format!("{}/{}", base_url, filename));
+            let temp_file = NamedTempFile::new()?;
 
             // Call the RemoteFetcher implementation
-            let result =
-                Cache::fetch_from_remote(filename.to_string(), "test-repo".to_string(), request)
-                    .await;
+            let result = Cache::fetch_from_remote(
+                temp_file,
+                filename.to_string(),
+                "test-repo".to_string(),
+                request,
+            )
+            .await;
 
             // Verify the result
             assert!(
@@ -268,7 +317,11 @@ mod tests {
                 filename
             );
             let fetch_result = result.unwrap();
-            assert_eq!(fetch_result.content, *content);
+            let mut f = File::open(fetch_result.downloaded_file).await?;
+            let mut s = String::new();
+            f.read_to_string(&mut s).await.unwrap();
+
+            assert_eq!(s.as_bytes().to_vec(), *content);
             assert_eq!(fetch_result.content_type, *expected_content_type);
         }
 
@@ -281,13 +334,16 @@ mod tests {
     #[async_trait]
     impl RemoteFetcher for MockRemoteFetcher {
         async fn fetch_from_remote(
+            temp_path: NamedTempFile,
             artifact_path: String,
             repo_name: String,
             _request: RequestBuilder,
         ) -> Option<FetchResult> {
             if artifact_path == "existing-artifact.jar" {
+                let mut file = File::create(&temp_path).await.unwrap();
+                let _ = file.write_all("mock content".as_bytes()).await.unwrap();
                 Some(FetchResult {
-                    content: Bytes::from("mock content"),
+                    downloaded_file: temp_path,
                     content_type: "application/java-archive".to_string(),
                     repository_name: repo_name,
                 })
@@ -299,8 +355,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_remote_fetcher() {
+        let temp_file = NamedTempFile::new().unwrap();
         // Test the mock implementation
         let result = MockRemoteFetcher::fetch_from_remote(
+            temp_file,
             "existing-artifact.jar".to_string(),
             "mock-repo".to_string(),
             reqwest::Client::new().get("http://example.com"),
@@ -309,11 +367,16 @@ mod tests {
 
         assert!(result.is_some());
         let fetch_result = result.unwrap();
-        assert_eq!(fetch_result.content, Bytes::from("mock content"));
-        assert_eq!(fetch_result.repository_name, "mock-repo");
+        let mut f = File::open(fetch_result.downloaded_file).await.unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).await.unwrap();
 
+        assert_eq!(s, "mock content");
+        assert_eq!(fetch_result.repository_name, "mock-repo");
+        let temp_file = NamedTempFile::new().unwrap();
         // Test with non-existent artifact
         let result = MockRemoteFetcher::fetch_from_remote(
+            temp_file,
             "non-existent.jar".to_string(),
             "mock-repo".to_string(),
             reqwest::Client::new().get("http://example.com"),

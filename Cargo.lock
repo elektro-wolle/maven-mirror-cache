@@ -1606,6 +1606,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sqlx",
+ "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "tokio",

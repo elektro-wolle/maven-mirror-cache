@@ -1,3 +1,5 @@
+extern crate core;
+
 mod cache;
 mod cache_database;
 mod config;
@@ -95,7 +97,6 @@ async fn handle_artifact(
     State(state): State<AppState>,
     Extension(timing): Extension<ServerTimingExtension>,
 ) -> Result<Response, StatusCode> {
-
     let timer_start = Instant::now();
     if let Some(cached_response) = state
         .cache
@@ -118,7 +119,11 @@ async fn handle_artifact(
         .await
     {
         Ok(response) => {
-            info!("Serving response for new artifact: {} = {}", artifact_path, response.status());
+            info!(
+                "Serving response for new artifact: {} = {}",
+                artifact_path,
+                response.status()
+            );
             timing.lock().unwrap().record_timing(
                 "download_and_cache".to_string(),
                 timer_start.elapsed(),
@@ -208,7 +213,9 @@ async fn cache_cleanup_task(config: &ProgramConfig, database: &CacheDatabase) {
         }
     }
 
-    let delete_file = DeleteCallback { cache_dir: config.cache_dir.clone() };
+    let delete_file = DeleteCallback {
+        cache_dir: config.cache_dir.clone(),
+    };
     loop {
         interval.tick().await;
 
@@ -263,6 +270,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Load configuration
     let config = config::load_config()?;
+    fs::create_dir_all(&config.cache_dir).await?;
 
     // Create application state
     let state = AppState::new(config.clone()).await?;

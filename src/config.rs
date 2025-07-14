@@ -4,6 +4,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::fs;
 
 // Repository configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]

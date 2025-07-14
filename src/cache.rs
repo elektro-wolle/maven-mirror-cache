@@ -1,10 +1,10 @@
 use crate::cache_database::{CacheDBAccess, CacheDatabase};
 use crate::config::Repository;
 use crate::remote_fetcher::RemoteFetcher;
-use crate::utils::{find_first, guess_content_type, sanitize_path, CancellableFuture};
+use crate::utils::{find_first, guess_content_type, sanitize_path};
 use crate::AppState;
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum_server_timing::ServerTimingExtension;
 use futures::{StreamExt, TryStreamExt};
@@ -12,16 +12,18 @@ use http_body_util::StreamBody;
 use std::ops::Mul;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+use tokio::fs;
+use tokio::fs::File;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
-use tokio::{fs, select};
 use tokio_util::io::ReaderStream;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 // Result of a repository fetch attempt
 #[derive(Debug)]
 pub struct FetchResult {
-    pub content: bytes::Bytes,
+    pub downloaded_file: NamedTempFile,
     pub content_type: String,
     pub repository_name: String,
 }
@@ -55,16 +57,43 @@ impl Cache {
 
         match result {
             Some(fetch_result) => {
-                let headers =
+                let (return_headers, file) =
                     Self::save_artifact_in_cache_dir(state, artifact_path, timing, &fetch_result)
                         .await?;
-                Ok((StatusCode::OK, headers, fetch_result.content.to_vec()).into_response())
+
+                match File::open(&file).await {
+                    Ok(file) => {
+                        // file is in the local cache -> serve directly
+                        Self::stream_file_with_headers(return_headers, file)
+                    }
+                    Err(e) => {
+                        Err(format!("Artifact {} not found in cache?: {}", artifact_path, e).into())
+                    }
+                }
             }
             None => {
                 Self::save_not_found_artifact_in_cache_db(state, artifact_path, timing).await;
                 Err(format!("Artifact {} not found in any repository", artifact_path).into())
             }
         }
+    }
+
+    fn stream_file_with_headers(
+        return_headers: HeaderMap,
+        file: File,
+    ) -> Result<Response, Box<dyn std::error::Error>> {
+        let stream = ReaderStream::new(file);
+        let body = StreamBody::new(stream).map_err(|e| e.to_string()).boxed();
+        let mut response = Response::builder();
+        let headers = response.headers_mut();
+        if let Some(headers) = headers {
+            return_headers.iter().for_each(|(k, v)| {
+                headers.insert(k, v.clone());
+            })
+        }
+        Ok(response
+            .status(StatusCode::OK)
+            .body(Body::from_stream(body))?)
     }
 
     async fn save_not_found_artifact_in_cache_db(
@@ -108,15 +137,20 @@ impl Cache {
         artifact_path: &str,
         timing: &ServerTimingExtension,
         fetch_result: &FetchResult,
-    ) -> Result<HeaderMap, Box<dyn std::error::Error>> {
+    ) -> Result<(HeaderMap, PathBuf), Box<dyn std::error::Error>> {
         let timer_start = Instant::now();
         // save in the local cache directory
         let relative_path = PathBuf::from(artifact_path);
         let cache_path = state.config.cache_dir.join(&relative_path);
-        fs::create_dir_all(cache_path.parent().unwrap()).await?;
-        fs::write(&cache_path, &fetch_result.content).await?;
-
-        let size_bytes = fetch_result.content.len() as i64;
+        let parent_dir = cache_path.parent();
+        if let Some(dir) = parent_dir {
+            fs::create_dir_all(dir).await?;
+        } else {
+            return Err("Unable to determine parent directory".into());
+        }
+        fs::rename(&fetch_result.downloaded_file, &cache_path).await?;
+        let metadata = fs::metadata(&cache_path).await?;
+        let size_bytes = metadata.len();
 
         timing.lock().unwrap().record_timing(
             "store_artifact".to_string(),
@@ -130,7 +164,7 @@ impl Cache {
             .insert_cache_entry(
                 artifact_path,
                 Some(&relative_path.to_string_lossy()),
-                Some(size_bytes),
+                Some(size_bytes as i64),
                 &fetch_result.content_type,
                 Some(&fetch_result.repository_name),
                 false,
@@ -160,7 +194,7 @@ impl Cache {
             "X-Source-Repository",
             fetch_result.repository_name.parse().unwrap(),
         );
-        Ok(headers)
+        Ok((headers, cache_path))
     }
 
     async fn try_to_fetch_from_remote(
@@ -176,7 +210,7 @@ impl Cache {
         );
         let timer_start = Instant::now();
         // Create futures for all repositories
-        let futures =
+        let mut futures =
             Self::generate_download_futures(state, artifact_path, &state.config.repositories);
         timing.lock().unwrap().record_timing(
             "prepare_download".to_string(),
@@ -185,6 +219,7 @@ impl Cache {
         );
 
         let timer_start = Instant::now();
+        futures.join_next().await;
         let result = find_first(futures).await?;
         // Cache the successful result
         timing.lock().unwrap().record_timing(
@@ -203,7 +238,11 @@ impl Cache {
         state: &AppState,
         artifact_path: &str,
         enabled_repos: &Vec<Repository>,
-    ) -> Vec<CancellableFuture<FetchResult>> {
+    ) -> JoinSet<Option<FetchResult>> {
+        use tokio::task::JoinSet;
+
+        let mut set = JoinSet::new();
+
         enabled_repos
             .iter()
             .map(move |repo| {
@@ -213,11 +252,10 @@ impl Cache {
                 let repo_name = repo.name.clone();
                 let timeout = repo.timeout.unwrap_or(Duration::new(30, 0));
                 let headers = repo.headers.clone();
+                let temp_file = NamedTempFile::new_in(&state.config.cache_dir);
                 // 10 ms per prio
                 let sleep_for_prio = Duration::new(0, 10_000_000).mul(repo.priority as u32);
-                let cancellation_token = CancellationToken::new();
-                let cancellation_token_clone = cancellation_token.clone();
-                let future = async move {
+                async move {
                     let mut request = client.get(&url).timeout(timeout);
 
                     if let Some(headers_map) = headers {
@@ -227,32 +265,25 @@ impl Cache {
                     }
 
                     // prioritize by sleeping
-                    select! {
-                        _ = cancellation_token_clone.cancelled() => {
-                            trace!("aborted request to {}", url)
-                        }
-                        _ = sleep(sleep_for_prio) => {
-                            ()
-                        }
-                    }
+                    sleep(sleep_for_prio).await;
                     info!("Fetching from {}: {}", repo_name, url);
-                    let result: Option<FetchResult> = select! {
-                        _ = cancellation_token_clone.cancelled() => {
-                            trace!("aborted request to {}", url);
+                    match temp_file {
+                        Ok(temp_file) => {
+                            // Convert to tokio File for async operations
+                            Self::fetch_from_remote(temp_file, artifact_path, repo_name, request)
+                                .await
+                        }
+                        Err(e) => {
+                            error!("Failed to create temporary file: {}", e);
                             None
                         }
-                        artifact = Self::fetch_from_remote(artifact_path, repo_name, request) =>
-                            artifact
-                    };
-                    result
-                };
-                (cancellation_token, future)
+                    }
+                }
             })
-            .map(|future| CancellableFuture {
-                cancellation_token: future.0,
-                handle: tokio::spawn(future.1),
-            })
-            .collect()
+            .for_each(|f| {
+                let _ = set.spawn(f);
+            });
+        set
     }
 
     /// Fire the request to the remote server, awaiting the response.
@@ -270,7 +301,7 @@ impl Cache {
         let path = sanitize_path(PathBuf::from(artifact_path));
         trace!("Sanitized artifact path: {:?} to {:?}", artifact_path, path);
         let full_path = state.config.cache_dir.join(path);
-        match fs::File::open(&full_path).await {
+        match File::open(&full_path).await {
             Ok(file) => {
                 let file_size = file.metadata().await;
                 if file_size.is_err() {
@@ -280,8 +311,6 @@ impl Cache {
                 let file_size = file_size.unwrap().len();
 
                 // file is in the local cache -> serve directly
-                let stream = ReaderStream::new(file);
-                let body = StreamBody::new(stream).map_err(|e| e.to_string()).boxed();
                 timing.lock().unwrap().record_timing(
                     "open_file".to_string(),
                     timer_start.elapsed(),
@@ -296,12 +325,15 @@ impl Cache {
                         warn!("failed to update last accessed of {}: {}", artifact_path, e)
                     });
 
-                let response = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_LENGTH, file_size)
-                    .header(header::CONTENT_TYPE, guess_content_type(&artifact_path))
-                    .header("X-Cache", "HIT")
-                    .body(Body::from_stream(body));
+                let mut headers = HeaderMap::new();
+                headers.append(header::CONTENT_LENGTH, file_size.into());
+                headers.append(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static(guess_content_type(&artifact_path)),
+                );
+                headers.append("X-Cache", HeaderValue::from_static("HIT"));
+
+                let response = Self::stream_file_with_headers(headers, file);
 
                 return Some(response.unwrap_or_else(|e| {
                     (
