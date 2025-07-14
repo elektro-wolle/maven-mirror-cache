@@ -4,7 +4,7 @@ A high-performance Maven repository mirror cache implemented in Rust. This servi
 
 == Features
 
-* **Multi-Repository Support**: Configure multiple Maven repositories with priority-based failover
+* **Multi-Repository Support**: Configure multiple Maven repositories with prioritized download from remote repos.
 
 * **Intelligent Caching**:
 ** Configurable cache TTL for artifacts
@@ -12,7 +12,6 @@ A high-performance Maven repository mirror cache implemented in Rust. This servi
 ** Automatic cache cleanup based on max. total size and last access
 ** **FAST**: 1.500 req/s, 500 MB/s easy to achieve with link:https://orbstack.dev[OrbStack] on a laptop.
 * **Concurrent Downloads**: Configurable limit on simultaneous downloads
-
 * **Database-Backend**: PostgreSQL backend for reliable metadata storage
 ** async tracking of downloads, not blocking the data-transfer
 
@@ -50,18 +49,13 @@ server:
 #        cert_path: "config/localhost.crt"
 #        key_path: "config/localhost.key"
 
-# Repository configurations - all are tried simultaneously, first success wins
-# The priority is converted to a sleep(), to increase the possibility of an
-# higher prioritized answer (0 = highest prio/no-sleep, 255 = lowest / 2.55 s sleep).
+# Repository configurations -  first success wins
 repositories:
     -   name: "maven-central"
         url: "https://repo1.maven.org/maven2"
-        priority: 0
         timeout: 30s
-
     -   name: "spring-releases"
         url: "https://repo.spring.io/release"
-        priority: 2
         timeout: 30s
 ----
 
@@ -173,4 +167,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 == License
 
 link:LICENSE[BSD 2-Clause License]
-

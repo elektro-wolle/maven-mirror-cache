@@ -4,14 +4,12 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::fs;
 
 // Repository configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Repository {
     pub name: String,
     pub url: String,
-    pub priority: u8,
     #[serde(with = "humantime_serde")]
     pub timeout: Option<Duration>,
     pub headers: Option<HashMap<String, String>>,
@@ -82,14 +80,12 @@ impl Default for ProgramConfig {
                 Repository {
                     name: "maven-central".to_string(),
                     url: "https://repo1.maven.org/maven2".to_string(),
-                    priority: 1,
                     timeout: Some(Duration::new(30, 0)),
                     headers: None,
                 },
                 Repository {
                     name: "maven-central-europe".to_string(),
                     url: "https://repo1.maven.org/maven2".to_string(),
-                    priority: 2,
                     timeout: Some(Duration::new(30, 0)),
                     headers: None,
                 },

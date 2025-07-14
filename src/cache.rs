@@ -1,7 +1,7 @@
 use crate::cache_database::{CacheDBAccess, CacheDatabase};
 use crate::config::Repository;
 use crate::remote_fetcher::RemoteFetcher;
-use crate::utils::{find_first, guess_content_type, sanitize_path};
+use crate::utils::{guess_content_type, sanitize_path};
 use crate::AppState;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -9,14 +9,11 @@ use axum::response::{IntoResponse, Response};
 use axum_server_timing::ServerTimingExtension;
 use futures::{StreamExt, TryStreamExt};
 use http_body_util::StreamBody;
-use std::ops::Mul;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use tokio::fs;
 use tokio::fs::File;
-use tokio::task::JoinSet;
-use tokio::time::sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, trace, warn};
 
@@ -209,9 +206,8 @@ impl Cache {
             state.config.repositories.len()
         );
         let timer_start = Instant::now();
-        // Create futures for all repositories
-        let mut futures =
-            Self::generate_download_futures(state, artifact_path, &state.config.repositories);
+        let remote_file =
+            Self::generate_download_futures(state, artifact_path, &state.config.repositories).await;
         timing.lock().unwrap().record_timing(
             "prepare_download".to_string(),
             timer_start.elapsed(),
@@ -219,71 +215,59 @@ impl Cache {
         );
 
         let timer_start = Instant::now();
-        futures.join_next().await;
-        let result = find_first(futures).await?;
         // Cache the successful result
         timing.lock().unwrap().record_timing(
             "fetch_artifact".to_string(),
             timer_start.elapsed(),
             None,
         );
-        Ok(result)
+        Ok(remote_file)
     }
 
     /// Create a vec of futures, each entry representing the download attempt to one
     /// of the configured remote repositories.
     ///
     /// The priority between the repositories is handled by an artificial sleep.
-    fn generate_download_futures(
+    async fn generate_download_futures(
         state: &AppState,
         artifact_path: &str,
         enabled_repos: &Vec<Repository>,
-    ) -> JoinSet<Option<FetchResult>> {
-        use tokio::task::JoinSet;
+    ) -> Option<FetchResult> {
+        for repo in enabled_repos {
+            let client = state.http_client.clone();
+            let artifact_path = artifact_path.to_string();
 
-        let mut set = JoinSet::new();
+            let url = format!("{}/{}", repo.url, artifact_path);
+            let repo_name = repo.name.clone();
+            let timeout = repo.timeout.unwrap_or(Duration::new(30, 0));
+            let headers = repo.headers.clone();
+            let temp_file = NamedTempFile::new_in(&state.config.cache_dir);
+            // 10 ms per prio
 
-        enabled_repos
-            .iter()
-            .map(move |repo| {
-                let client = state.http_client.clone();
-                let artifact_path = artifact_path.to_string();
-                let url = format!("{}/{}", repo.url, artifact_path);
-                let repo_name = repo.name.clone();
-                let timeout = repo.timeout.unwrap_or(Duration::new(30, 0));
-                let headers = repo.headers.clone();
-                let temp_file = NamedTempFile::new_in(&state.config.cache_dir);
-                // 10 ms per prio
-                let sleep_for_prio = Duration::new(0, 10_000_000).mul(repo.priority as u32);
-                async move {
-                    let mut request = client.get(&url).timeout(timeout);
+            let mut request = client.get(&url).timeout(timeout);
 
-                    if let Some(headers_map) = headers {
-                        for (key, value) in headers_map {
-                            request = request.header(&key, &value);
-                        }
-                    }
+            if let Some(headers_map) = headers {
+                for (key, value) in headers_map {
+                    request = request.header(&key, &value);
+                }
+            }
 
-                    // prioritize by sleeping
-                    sleep(sleep_for_prio).await;
-                    info!("Fetching from {}: {}", repo_name, url);
-                    match temp_file {
-                        Ok(temp_file) => {
-                            // Convert to tokio File for async operations
-                            Self::fetch_from_remote(temp_file, artifact_path, repo_name, request)
-                                .await
-                        }
-                        Err(e) => {
-                            error!("Failed to create temporary file: {}", e);
-                            None
-                        }
+            info!("Fetching from {}: {}", repo_name, url);
+            match temp_file {
+                Ok(temp_file) => {
+                    match Self::fetch_from_remote(temp_file, artifact_path, repo_name, request)
+                        .await
+                    {
+                        Some(fetch_result) => return Some(fetch_result),
+                        None => continue,
                     }
                 }
-            })
-            .for_each(|f| {
-                let _ = set.spawn(f);
-            });
-        set
+                Err(e) => {
+                    error!("Failed to create temporary file: {}", e);
+                }
+            }
+        }
+        None
     }
 
     /// Fire the request to the remote server, awaiting the response.
