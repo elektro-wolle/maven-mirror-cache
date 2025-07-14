@@ -1,7 +1,7 @@
 use crate::cache_database::{CacheDBAccess, CacheDatabase};
 use crate::config::Repository;
 use crate::remote_fetcher::RemoteFetcher;
-use crate::utils::{find_first, guess_content_type, sanitize_path};
+use crate::utils::{find_first, guess_content_type, sanitize_path, CancellableFuture};
 use crate::AppState;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -12,11 +12,11 @@ use http_body_util::StreamBody;
 use std::ops::Mul;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tokio::fs;
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio::{fs, select};
 use tokio_util::io::ReaderStream;
-use tracing::{debug, error, info, warn, trace};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, trace, warn};
 
 // Result of a repository fetch attempt
 #[derive(Debug)]
@@ -203,7 +203,7 @@ impl Cache {
         state: &AppState,
         artifact_path: &str,
         enabled_repos: &Vec<Repository>,
-    ) -> Vec<JoinHandle<Option<FetchResult>>> {
+    ) -> Vec<CancellableFuture<FetchResult>> {
         enabled_repos
             .iter()
             .map(move |repo| {
@@ -215,7 +215,8 @@ impl Cache {
                 let headers = repo.headers.clone();
                 // 10 ms per prio
                 let sleep_for_prio = Duration::new(0, 10_000_000).mul(repo.priority as u32);
-
+                let cancellation_token = CancellationToken::new();
+                let cancellation_token_clone = cancellation_token.clone();
                 let future = async move {
                     let mut request = client.get(&url).timeout(timeout);
 
@@ -224,14 +225,33 @@ impl Cache {
                             request = request.header(&key, &value);
                         }
                     }
+
                     // prioritize by sleeping
-                    sleep(sleep_for_prio).await;
+                    select! {
+                        _ = cancellation_token_clone.cancelled() => {
+                            trace!("aborted request to {}", url)
+                        }
+                        _ = sleep(sleep_for_prio) => {
+                            ()
+                        }
+                    }
                     info!("Fetching from {}: {}", repo_name, url);
-                    Self::fetch_from_remote(artifact_path, repo_name, request).await
+                    let result: Option<FetchResult> = select! {
+                        _ = cancellation_token_clone.cancelled() => {
+                            trace!("aborted request to {}", url);
+                            None
+                        }
+                        artifact = Self::fetch_from_remote(artifact_path, repo_name, request) =>
+                            artifact
+                    };
+                    result
                 };
-                return future;
+                (cancellation_token, future)
             })
-            .map(|future| tokio::spawn(future))
+            .map(|future| CancellableFuture {
+                cancellation_token: future.0,
+                handle: tokio::spawn(future.1),
+            })
             .collect()
     }
 

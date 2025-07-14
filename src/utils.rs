@@ -3,21 +3,27 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::path::{Component, PathBuf};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+pub struct CancellableFuture<T> {
+    pub cancellation_token: CancellationToken,
+    pub handle: JoinHandle<Option<T>>,
+}
 
 /// Asynchronously finds the first successful result from a list of futures.
 ///
-/// This function takes a vector of `JoinHandle<Option<FetchResult>>` and returns the first successful result
+/// This function takes a vector of `CancellableFuture<T>>` and returns the first successful result
 /// encountered. It uses `FuturesUnordered` to manage the futures concurrently. If a future returns a successful
 /// result, all remaining futures are aborted.
 ///
 /// # Arguments
 ///
-/// * `futures` - A vector of `JoinHandle<Option<FetchResult>>` representing asynchronous tasks.
+/// * `futures` - A vector of `CancellableFuture<T>` representing asynchronous tasks.
 ///
 /// # Returns
 ///
-/// * `Result<Option<FetchResult>, Box<dyn std::error::Error>>` - The first successful result wrapped in `Ok(Some(val))`.
+/// * `Result<Option<T>, Box<dyn std::error::Error>>` - The first successful result wrapped in `Ok(Some(val))`.
 ///   If all futures complete without a successful result, it returns `Ok(None)`. If an error occurs during execution,
 ///   it logs the error and continues processing the remaining futures.
 ///
@@ -43,21 +49,21 @@ use tracing::info;
 /// }
 /// ```
 pub async fn find_first(
-    futures: Vec<JoinHandle<Option<FetchResult>>>,
+    futures: Vec<CancellableFuture<FetchResult>>,
 ) -> Result<Option<FetchResult>, Box<dyn std::error::Error>> {
     let mut futures_unordered = FuturesUnordered::new();
+    let cancellation_tokens = futures
+        .iter()
+        .map(|f| f.cancellation_token.clone())
+        .collect::<Vec<_>>();
     for fut in futures {
-        futures_unordered.push(fut);
+        futures_unordered.push(fut.handle);
     }
 
     while let Some(res) = futures_unordered.next().await {
         match res {
             Ok(Some(val)) => {
-                futures_unordered.into_iter().for_each(|o| {
-                    if !o.is_finished() {
-                        o.abort();
-                    }
-                });
+                cancellation_tokens.iter().for_each(|f| f.cancel());
                 return Ok(Some(val));
             }
             Ok(None) => {
@@ -115,7 +121,7 @@ pub fn guess_content_type(path: &str) -> &'static str {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::task::JoinHandle;
+    use tokio::select;
     use tokio::time::sleep;
 
     #[tokio::test]
@@ -143,27 +149,51 @@ mod tests {
     #[tokio::test]
     async fn test_find_first_with_success() {
         // Create a Vec of futures where one returns Some
-        let futures: Vec<JoinHandle<Option<FetchResult>>> = vec![
-            tokio::spawn(async {
-                sleep(Duration::from_millis(50)).await;
-                None
-            }),
-            tokio::spawn(async {
-                sleep(Duration::from_millis(10)).await;
-                Some(FetchResult {
-                    content: bytes::Bytes::from("test content"),
-                    content_type: "text/plain".to_string(),
-                    repository_name: "test-repo".to_string(),
-                })
-            }),
-            tokio::spawn(async {
-                sleep(Duration::from_millis(100)).await;
-                Some(FetchResult {
-                    content: bytes::Bytes::from("should not be returned"),
-                    content_type: "text/plain".to_string(),
-                    repository_name: "another-repo".to_string(),
-                })
-            }),
+        let token1 = CancellationToken::new();
+        let token1_clone = token1.clone();
+        let token2 = CancellationToken::new();
+        let token2_clone = token2.clone();
+        let token3 = CancellationToken::new();
+        let token3_clone = token3.clone();
+        let futures: Vec<CancellableFuture<FetchResult>> = vec![
+            CancellableFuture {
+                cancellation_token: token1_clone,
+                handle: tokio::spawn(async move {
+                    select! {
+                        _ = token1.cancelled() => info!("token cancelled"),
+                        _ = sleep(Duration::from_millis(50)) => ()
+                    }
+                    None
+                }),
+            },
+            CancellableFuture {
+                cancellation_token: token2_clone,
+                handle: tokio::spawn(async move {
+                    select! {
+                        _ = token2.cancelled() => info!("token cancelled"),
+                        _ = sleep(Duration::from_millis(10)) => ()
+                    }
+                    Some(FetchResult {
+                        content: bytes::Bytes::from("test content"),
+                        content_type: "text/plain".to_string(),
+                        repository_name: "test-repo".to_string(),
+                    })
+                }),
+            },
+            CancellableFuture {
+                cancellation_token: token3_clone,
+                handle: tokio::spawn(async move {
+                    select! {
+                        _ = token3.cancelled() => info!("token cancelled"),
+                        _ = sleep(Duration::from_millis(100)) => ()
+                    }
+                    Some(FetchResult {
+                        content: bytes::Bytes::from("should not be returned"),
+                        content_type: "text/plain".to_string(),
+                        repository_name: "another-repo".to_string(),
+                    })
+                }),
+            },
         ];
 
         let result = find_first(futures).await.unwrap();
@@ -175,16 +205,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_first_with_all_none() {
+        let token1 = CancellationToken::new();
+        let token1_clone = token1.clone();
+        let token2 = CancellationToken::new();
+        let token2_clone = token2.clone();
+
         // Create a Vec of futures where all return None
-        let futures: Vec<JoinHandle<Option<FetchResult>>> = vec![
-            tokio::spawn(async {
-                sleep(Duration::from_millis(10)).await;
-                None
-            }),
-            tokio::spawn(async {
-                sleep(Duration::from_millis(20)).await;
-                None
-            }),
+        let futures: Vec<CancellableFuture<FetchResult>> = vec![
+            CancellableFuture {
+                cancellation_token: token1_clone,
+                handle: tokio::spawn(async {
+                    sleep(Duration::from_millis(10)).await;
+                    None
+                }),
+            },
+            CancellableFuture {
+                cancellation_token: token2_clone,
+                handle: tokio::spawn(async {
+                    sleep(Duration::from_millis(20)).await;
+                    None
+                }),
+            },
         ];
 
         let result = find_first(futures).await.unwrap();
@@ -193,25 +234,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_first_with_errors() {
+        let token1 = CancellationToken::new();
+        let token1_clone = token1.clone();
+        let token2 = CancellationToken::new();
+        let token2_clone = token2.clone();
+        let token3 = CancellationToken::new();
+        let token3_clone = token3.clone();
+
         // Create a Vec of futures where some panic
-        let futures: Vec<JoinHandle<Option<FetchResult>>> = vec![
-            tokio::spawn(async {
-                panic!("This future panics");
-                #[allow(unreachable_code)]
-                None
-            }),
-            tokio::spawn(async {
-                sleep(Duration::from_millis(10)).await;
-                None
-            }),
-            tokio::spawn(async {
-                sleep(Duration::from_millis(20)).await;
-                Some(FetchResult {
-                    content: bytes::Bytes::from("valid result"),
-                    content_type: "text/plain".to_string(),
-                    repository_name: "error-test-repo".to_string(),
-                })
-            }),
+        let futures: Vec<CancellableFuture<FetchResult>> = vec![
+            CancellableFuture {
+                cancellation_token: token1_clone,
+                handle: tokio::spawn(async {
+                    panic!("This future panics");
+                    #[allow(unreachable_code)]
+                    None
+                }),
+            },
+            CancellableFuture {
+                cancellation_token: token2_clone,
+                handle: tokio::spawn(async {
+                    sleep(Duration::from_millis(10)).await;
+                    None
+                }),
+            },
+            CancellableFuture {
+                cancellation_token: token3_clone,
+                handle: tokio::spawn(async {
+                    sleep(Duration::from_millis(20)).await;
+                    Some(FetchResult {
+                        content: bytes::Bytes::from("valid result"),
+                        content_type: "text/plain".to_string(),
+                        repository_name: "error-test-repo".to_string(),
+                    })
+                }),
+            },
         ];
 
         let result = find_first(futures).await.unwrap();
